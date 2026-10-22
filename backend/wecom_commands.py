@@ -1,4 +1,4 @@
-"""Read-only WeCom commands behind the existing authenticated callback bridge."""
+"""Per-channel authenticated WeCom read-only commands."""
 import base64,hashlib,hmac,json,re,secrets,struct,time
 import xml.etree.ElementTree as ET
 from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
@@ -6,12 +6,11 @@ from datetime import datetime,timezone,timedelta
 from pathlib import Path
 from fastapi import HTTPException,Request,Response
 
-CONFIG=Path('/run/secrets/wecom-command-bridge.json')
-HELP='信匣查询指令\n帮助\n号码列表\n状态 号码尾号\n短信 号码尾号（最近5条）\n来电 号码尾号（最近5通）\n仅查询网站账号归属号码；时间为北京时间，敏感正文遵循渠道设置。\n管理员可在对应企业微信应用渠道中开启指令查询并指定成员。查询范围和敏感正文权限继承该渠道。'
+
+HELP='信匣查询指令\n帮助\n来源列表\n状态 来源标识\n消息 来源标识（最近5条）\n来电 来源标识（最近5通）\n仅查询网站账号归属来源；时间为北京时间，敏感正文遵循渠道设置。\n在对应企业微信应用渠道中开启指令查询并指定成员。查询范围和敏感正文权限继承该渠道。'
 
 def config():
-    try:return json.loads(CONFIG.read_text())
-    except (OSError,ValueError):return None
+    return None # Standalone edition uses per-channel encrypted callbacks.
 
 def stamp(value):
     try:
@@ -39,20 +38,18 @@ def register(app,database,cipher,current_user):
         rows=db.execute('SELECT n.* FROM managed_numbers n JOIN number_owners o ON o.number_key=n.number_key WHERE o.user_id=? AND o.deleted=0 ORDER BY n.created_at',(uid,)).fetchall()
         if rules.get('accounts'):rows=[r for r in rows if r['number_key'] in rules['accounts']]
         entries=[(r,json.loads(cipher().decrypt(r['encrypted_profile']))) for r in rows]
-        if content in ('号码列表','我的号码','短信号码'):
+        if content in ('来源列表','号码列表','我的号码','短信号码'):
             audit(db,uid,'wecom_numbers')
-            text='你的号码（SDK存活不保证运营商投递）：\n'+'\n'.join(f"{p['number']} · {p.get('label') or '无备注'} · "+('存活' if (p.get('receiver') or {}).get('state')=='online' and time.time()-(p.get('receiver') or {}).get('heartbeat',0)<90 else '未连接') for _,p in entries[:15]) if entries else '你的账号暂无号码。'
+            text='你的来源（HTTP接入）：\n'+'\n'.join(f"{p['number']} · {p.get('label') or '无备注'} · "+('已提交事件' if p.get('last_event_at') else '等待提交') for _,p in entries[:15]) if entries else '你的账号暂无来源。'
             return text+ ('\n更多号码请在网站查看。' if len(entries)>15 else '')
-        match=re.fullmatch(r'(状态|短信|来电)(?:\s+([+0-9]{4,16}))?',content)
+        match=re.fullmatch(r'(状态|消息|短信|来电)(?:\s+(.{1,128}))?',content)
         if not match:return HELP
-        kind,number=match.groups();found=[(r,p) for r,p in entries if not number or p['number'].endswith(number.lstrip('+'))]
+        kind,number=match.groups();kind='短信' if kind=='消息' else kind;found=[(r,p) for r,p in entries if not number or p['number'].endswith(number.lstrip('+'))]
         if not found:return '未找到归属于你的号码，请发送「号码列表」。'
         if len(found)!=1:return '匹配到多个号码，请使用完整号码或更长尾号。'
         r,p=found[0];audit(db,uid,{'状态':'wecom_status','短信':'wecom_sms','来电':'wecom_calls'}[kind])
         if kind=='状态':
-            health=p.get('receiver') or {};live=health.get('state')=='online' and time.time()-health.get('heartbeat',0)<90
-            hosting=p.get('hosting') or {}
-            return f"{p['number']} · {p.get('label') or '无备注'}\n接收器：{'存活' if live else '未连接或状态过期'}\n托管缓存："+('开启' if str(hosting.get('cs_forward'))=='2' else '关闭' if hosting else '未知')+'\n托管查询时间：'+(datetime.fromtimestamp(p['hosting_checked_at'],timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S') if p.get('hosting_checked_at') else '未查询')+'\n状态为已有记录，未调用托管开关。'
+            return f"{p['number']} · {p.get('label') or '无备注'}\n来源状态："+p.get('status_label','HTTP 接入就绪')+'\n最近事件时间：'+(datetime.fromtimestamp(p.get('last_event_at',0),timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S') if p.get('last_event_at') else '尚未提交')+'\n此版本仅接收HTTP提交的数据，不连接运营商。'
         if kind=='短信' and 'sms' not in rules.get('events',['sms']):return '此渠道未开放短信查询。'
         if kind=='来电' and 'call' not in rules.get('events',[]):return '此渠道未开放来电查询。'
         if kind=='短信':
@@ -70,22 +67,6 @@ def register(app,database,cipher,current_user):
             label={'incoming':'来电','missed':'未接来电','ended':'来电结束（不代表已接听）'}.get(item.get('event'),'来电事件')
             parts.append(stamp(event['received_at'])+' · '+str(item.get('sender') or '未知主叫')+' · '+label)
         return p['number']+' 最近来电（北京时间）\n'+('\n'.join(parts) if parts else '暂无记录')
-    @app.post('/internal/wecom/command')
-    async def receive(request:Request):
-        cfg=config()
-        if not cfg:raise HTTPException(503,'指令服务未配置')
-        raw=await request.body()
-        if len(raw)>8192:raise HTTPException(413,'请求过大')
-        signature=request.headers.get('x-wecom-bridge-signature','')
-        if not hmac.compare_digest(signature,hmac.new(cfg['key'].encode(),raw,hashlib.sha256).hexdigest()):raise HTTPException(403,'签名无效')
-        try:
-            data=json.loads(raw)
-            if data['corp_id']!=cfg['corp_id'] or str(data['agent_id'])!=str(cfg['agent_id']) or abs(time.time()-int(data['timestamp']))>90:raise ValueError()
-            member=data['member'];content=data['content'].strip()
-            if not isinstance(member,str) or not 1<=len(member)<=128 or len(content)>2048 or not data['message_id']:raise ValueError()
-        except (KeyError,TypeError,ValueError,AttributeError):raise HTTPException(400,'消息无效')
-        return run(member,content,data['corp_id'],data['agent_id'],str(data['message_id']))
-
     def run(member,content,corp,agent,message_id,channel_id=None):
         identity=hashlib.sha256(json.dumps([corp,str(agent),member,channel_id]).encode()).hexdigest()
         reqid=hashlib.sha256((identity+':'+message_id).encode()).hexdigest();now=int(time.time())

@@ -1,4 +1,4 @@
-"""Authenticated SMS console. The collector database is a read-only source."""
+"""Standalone authenticated message hub with source-scoped HTTP ingestion."""
 import asyncio
 import base64
 import hashlib
@@ -16,16 +16,15 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import forwarding
 import wecom_commands
+import ingress
 
 os.umask(0o077)
 DATA = Path(os.getenv("SMS_DATA_DIR", "/data"))
-SOURCE = Path(os.getenv("SMS_SOURCE_DB", "/source/research-sms.sqlite3"))
-SOURCE_KEY = Path(os.getenv("SMS_SOURCE_KEY", "/source/sms-storage.key"))
 STATIC = Path(os.getenv("SMS_STATIC_DIR", "/app/static"))
 DB = DATA / "platform.sqlite3"
 COOKIE = "sms_console_session"
@@ -111,18 +110,13 @@ def initialize():
         CREATE TABLE IF NOT EXISTS managed_numbers (
             id TEXT PRIMARY KEY, number_key TEXT UNIQUE NOT NULL,
             encrypted_profile BLOB NOT NULL, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS control_jobs (
-            id TEXT PRIMARY KEY, number_id TEXT NOT NULL REFERENCES managed_numbers(id),
-            action TEXT NOT NULL, encrypted_payload BLOB, state TEXT NOT NULL,
-            result TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS call_events (
             id INTEGER PRIMARY KEY, fingerprint TEXT UNIQUE NOT NULL,
             account_key TEXT NOT NULL, encrypted_record BLOB NOT NULL,
             received_at TEXT NOT NULL);
         """)
         db.executescript("CREATE TABLE IF NOT EXISTS site_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS announcements(id TEXT PRIMARY KEY,title TEXT NOT NULL,body TEXT NOT NULL,published INTEGER NOT NULL,popup INTEGER NOT NULL,once_only INTEGER NOT NULL,revision INTEGER NOT NULL,updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS announcement_reads(user_id INTEGER NOT NULL,announcement_id TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(user_id,announcement_id));")
-        db.execute("INSERT OR IGNORE INTO site_settings VALUES('registration_open','true')")
-        db.execute('CREATE TABLE IF NOT EXISTS number_credentials(number_id TEXT PRIMARY KEY,encrypted_record BLOB NOT NULL,updated_at INTEGER NOT NULL)')
+        db.execute("INSERT OR IGNORE INTO site_settings VALUES('registration_open','false')")
         columns={r[1] for r in db.execute('PRAGMA table_info(users)')}
         if 'role' not in columns: db.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
         if 'disabled' not in columns: db.execute('ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0')
@@ -143,7 +137,9 @@ def initialize():
         if not db.execute("SELECT 1 FROM users LIMIT 1").fetchone():
             path = Path(os.getenv("SMS_ADMIN_PASSWORD_FILE", "/run/secrets/admin_password"))
             if not path.is_file():
-                raise RuntimeError("Initial admin password file is required")
+                path=DATA/'initial-admin-password.txt'
+                if not path.exists():path.write_text(secrets.token_urlsafe(24)+'\n');path.chmod(0o600)
+                print('Initial administrator password stored in /data/initial-admin-password.txt',flush=True)
             password = path.read_text().strip()
             if len(password) < 6:
                 raise RuntimeError("Initial password must be at least 6 characters")
@@ -165,66 +161,24 @@ def utc_text(value):
         return None
 
 
-def import_source():
-    if not SOURCE.is_file() or not SOURCE_KEY.is_file():
-        sync_state.update(state="unavailable", error="短信数据源尚未连接")
-        return
-    source = sqlite3.connect(SOURCE.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
-    source.row_factory = sqlite3.Row
-    try:
-        source.execute("PRAGMA query_only=ON")
-        with database() as db:
-            cursor = db.execute("SELECT COALESCE(MAX(source_id),0) FROM messages WHERE source='jegotrip'").fetchone()[0]
-        rows = source.execute("SELECT id,encrypted_record,ingested_at FROM received WHERE id>? ORDER BY id LIMIT 500", (cursor,)).fetchall()
-    finally:
-        source.close()
-    source_crypto, target_crypto = Fernet(SOURCE_KEY.read_bytes()), cipher()
-    imported = 0
-    with database() as db:
-        for row in rows:
-            item = json.loads(source_crypto.decrypt(row["encrypted_record"]))
-            if not all(isinstance(item.get(k), str) for k in ("account", "sender", "body", "time")):
-                raise ValueError("Invalid collector record")
-            ingested = utc_text(row["ingested_at"])
-            if ingested is None:
-                raise ValueError("Invalid ingestion timestamp")
-            received = utc_text(item["time"])
-            item["source_time_parsed"] = received is not None
-            blob = target_crypto.encrypt(json.dumps(item, ensure_ascii=False).encode())
-            result = db.execute("INSERT OR IGNORE INTO messages(source,source_id,account_key,encrypted_record,received_at,ingested_at) VALUES('jegotrip',?,?,?,?,?)",
-                                (row["id"], key_hash(item["account"]), blob, received or ingested, ingested))
-            imported += result.rowcount
-            if result.rowcount:
-                forwarding.enqueue(db,result.lastrowid)
-        db.execute("DELETE FROM sessions WHERE expires_at<?", (int(time.time()),))
-        db.execute("DELETE FROM login_failures WHERE created_at<?", (int(time.time()) - 900,))
-    sync_state.update(state="connected", error=None, last_sync=int(time.time()), imported=imported)
-    bridge_path = SOURCE.parent / "bridge-status.json"
-    if bridge_path.is_file():
-        bridge = json.loads(bridge_path.read_text())
-        if bridge.get("state") != "connected" or time.time() - bridge.get("heartbeat", 0) > 30:
-            sync_state.update(state="error", error="数据源更新已中断，当前显示的是已有记录")
-
-
 async def synchronize():
-    async with sync_lock:
-        try:
-            await asyncio.to_thread(import_source)
-        except (sqlite3.Error, OSError, ValueError, InvalidToken):
-            # Never put message content, credentials or filesystem paths in logs/API errors.
-            sync_state.update(state="error", error="短信同步失败，请检查数据源连接和密钥")
-
+    with database() as db:
+        db.execute('DELETE FROM sessions WHERE expires_at<?',(int(time.time()),))
+        db.execute('DELETE FROM login_failures WHERE created_at<?',(int(time.time())-900,))
+    sync_state.update(state='connected',last_sync=int(time.time()),error=None,mode='http')
 
 async def sync_loop():
     while True:
         await synchronize()
-        await asyncio.sleep(5)
+        await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app):
     initialize()
-    with database() as db: app.state.init_wecom_commands(db)
+    with database() as db:
+        app.state.init_wecom_commands(db)
+        app.state.init_ingress(db)
     forwarding.initialize()
     await synchronize()
     task = asyncio.create_task(sync_loop())
@@ -238,11 +192,18 @@ async def lifespan(app):
         pass
 
 
-app = FastAPI(title="信匣 SMS Console", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="Xinbox Message Hub", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 @app.middleware("http")
 async def protections(request, call_next):
+    if request.method in ("POST", "PUT", "PATCH"):
+        chunks=[];size=0
+        async for chunk in request.stream():
+            size+=len(chunk)
+            if size>131072:return JSONResponse({"detail":"请求体不能超过128 KiB"},status_code=413)
+            chunks.append(chunk)
+        request._body=b''.join(chunks)
     origin = request.headers.get("origin")
     if request.method not in ("GET", "HEAD", "OPTIONS") and origin:
         parsed = urlsplit(origin)
@@ -250,12 +211,9 @@ async def protections(request, call_next):
             return JSONResponse({"detail": "请求来源不允许"}, status_code=403)
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "SAMEORIGIN" if request.url.path == '/login-captcha' else "DENY"
+    response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-    if request.url.path == '/login-captcha':
-        response.headers['Content-Security-Policy'] = "default-src 'none'; script-src 'unsafe-inline' https://*.aliyuncs.com https://*.alicdn.com; style-src 'unsafe-inline'; img-src https: data: blob:; connect-src https://*.aliyuncs.com https://*.alicdn.com; worker-src blob:; frame-src https:; frame-ancestors 'self'; base-uri 'none'; form-action 'none'; sandbox allow-scripts"
-        response.headers['Cache-Control'] = 'no-store'
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store"
     return response
@@ -290,7 +248,7 @@ def account_scope(user,column='account_key'):
 def require_number(db,ident,user,deleted=False):
     row=db.execute('SELECT n.*,o.user_id AS owner_id,o.deleted FROM managed_numbers n LEFT JOIN number_owners o ON o.number_key=n.number_key WHERE n.id=?',(ident,)).fetchone()
     if not row or (row['deleted'] and not deleted) or (not user.get('admin_scope') and row['owner_id']!=user['user_id']):
-        raise HTTPException(404,'号码不存在')
+        raise HTTPException(404,'来源不存在')
     return row
 
 
@@ -308,7 +266,7 @@ class Register(BaseModel):
 async def register_user(data:Register,request:Request):
     if not re.fullmatch(r'[A-Za-z0-9_.-]{2,64}',data.username):raise HTTPException(422,'用户名使用2至64位字母、数字、点、横线或下划线')
     now=int(time.time())
-    ip_hash=key_hash(request.headers.get('x-real-ip') or (request.client.host if request.client else 'unknown'))
+    ip_hash=key_hash(request.client.host if request.client else 'unknown')
     with database() as db:
         db.execute('BEGIN IMMEDIATE')
         if db.execute("SELECT value FROM site_settings WHERE key='registration_open'").fetchone()[0]!='true':raise HTTPException(403,'管理员已关闭公开注册')
@@ -330,7 +288,7 @@ async def register_user(data:Register,request:Request):
 @app.post("/api/auth/login")
 async def login(data: Login, request: Request, response: Response):
     now = int(time.time())
-    ip_hash = key_hash(request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown"))
+    ip_hash = key_hash(request.client.host if request.client else "unknown")
     with database() as db:
         attempts = db.execute("SELECT COUNT(*) FROM login_failures WHERE ip_hash=? AND created_at>?", (ip_hash, now - 900)).fetchone()[0]
         if attempts >= 8:
@@ -371,13 +329,13 @@ def serialize_message(row, reveal=False):
     sensitive = bool(SENSITIVE.search(body))
     # Hide the complete sensitive body, including alphabetic/long codes that a
     # digits-only replacement would miss. Explicit reveal remains audited.
-    masked = "敏感短信内容已隐藏，进入详情可按需查看原文。" if sensitive else body
+    masked = "敏感消息内容已隐藏，进入详情可按需查看原文。" if sensitive else body
     return {"id": row["id"], "account_key": row["account_key"], "recipient": item["account"],
             "sender": item["sender"], "body": body if reveal else masked,
             "sensitive": sensitive, "redacted": sensitive and not reveal,
             "received_at": row["received_at"], "ingested_at": row["ingested_at"],
             "source_time_raw": item["time"], "source_time_parsed": item.get("source_time_parsed", False),
-            "source": "无忧行", "offline": bool(item.get("offline")),
+            "source": item.get("source_name","HTTP 接入"), "offline": bool(item.get("offline")),
             "is_read": bool(row["is_read"]), "archived": bool(row["archived"]), "sync_status": "synced"}
 
 
@@ -447,7 +405,7 @@ def message_detail(message_id: int, user=Depends(current_user)):
         scope,args=account_scope(user)
         row = db.execute("SELECT * FROM messages WHERE id=? AND "+scope, [message_id,*args]).fetchone()
     if row is None:
-        raise HTTPException(404, "短信不存在")
+        raise HTTPException(404, "消息不存在")
     return serialize_message(row)
 
 
@@ -458,7 +416,7 @@ def reveal_message(message_id: int, user=Depends(current_user)):
         scope,args=account_scope(user)
         row = db.execute("SELECT * FROM messages WHERE id=? AND "+scope, [message_id,*args]).fetchone()
         if row is None:
-            raise HTTPException(404, "短信不存在")
+            raise HTTPException(404, "消息不存在")
         db.execute("INSERT INTO audit(user_id,action,message_id,created_at) VALUES(?,'reveal',?,?)", (user["user_id"], message_id, int(time.time())))
     return serialize_message(row, reveal=True)
 
@@ -517,7 +475,7 @@ def audit_log(user=Depends(current_user)):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok","edition":"standalone"}
 
 
 if STATIC.is_dir():
@@ -534,33 +492,18 @@ def index():
 
 
 def collector_status():
-    try:
-        value = json.loads((SOURCE.parent / "receiver-status.json").read_text())
-        if time.time() - value.get("heartbeat", 0) > 90:
-            value.update(state="stale", label="接收器状态已过期")
-        return value
-    except (OSError, ValueError):
-        return {"state": "unknown", "label": "尚未取得接收器状态"}
+    return {'state':'api','label':'HTTP 接入接口已就绪；消息需由授权来源主动提交'}
 
 
 class NumberInput(BaseModel):
-    mobile: str = Field(min_length=5, max_length=20)
-    country_code: str = Field(default="86", max_length=5)
-    label: str = Field(default="", max_length=80)
-    authorized: bool = False
+    address:str=Field(min_length=1,max_length=128)
+    label:str=Field(default='',max_length=80)
+    authorized:bool=False
 
 
 class NumberEdit(BaseModel):
     label: str = Field(max_length=80)
     archived: bool = False
-
-
-class NumberAction(BaseModel):
-    action: str
-    token: str = Field(default="", max_length=8192)
-    device_id: str = Field(default="", max_length=4096)
-    captcha_token: str = Field(default="", max_length=32768)
-    code: str = Field(default="", max_length=8)
 
 
 def number_profile(row):
@@ -581,21 +524,16 @@ def numbers_list(user=Depends(current_user)):
 
 @app.post("/api/numbers")
 def number_create(data: NumberInput, user=Depends(current_user)):
-    cc, mobile = data.country_code.lstrip("+"), data.mobile.strip()
-    if not data.authorized or not re.fullmatch(r"[1-9]\d{0,3}", cc) or not re.fullmatch(r"\d{5,15}", mobile) or len(cc + mobile) > 15:
-        raise HTTPException(400, "请填写有效号码并确认管理授权")
-    number = "+" + cc + mobile
-    profile = {"number": number, "mobile": mobile, "country_code": cc, "label": data.label.strip(), "archived": False, "state": "pending", "status_label": "待登录接入"}
+    number=data.address.strip()
+    if not data.authorized or not number or any(ord(c)<32 or ord(c)==127 for c in number):raise HTTPException(400,'请输入有效接收标识并确认授权')
+    profile={'number':number,'label':data.label.strip(),'archived':False,'state':'api','status_label':'HTTP 接入就绪'}
     ident = secrets.token_hex(16)
     with database() as db:
         db.execute('BEGIN IMMEDIATE')
         old=db.execute('SELECT n.*,o.user_id AS owner_id,o.deleted FROM managed_numbers n LEFT JOIN number_owners o ON o.number_key=n.number_key WHERE n.number_key=?',(key_hash(number),)).fetchone()
         if old:
-            if old['owner_id']!=user['user_id'] and not user.get('admin_scope'):raise HTTPException(409,'此号码已绑定其他账号，请联系管理员')
-            if not old['deleted']:raise HTTPException(409,'此号码已经添加，请直接使用验证码登录')
-            if db.execute("SELECT 1 FROM control_jobs WHERE number_id=? AND state IN ('queued','running')",(old['id'],)).fetchone():raise HTTPException(409,'号码正在停止接收，请稍后重新添加')
-            job=db.execute("SELECT state FROM control_jobs WHERE number_id=? AND action='delete' ORDER BY created_at DESC LIMIT 1",(old['id'],)).fetchone()
-            if job and job[0]!='done':raise HTTPException(409,'删除尚未完成，请在回收站重试停止接收')
+            if old['owner_id']!=user['user_id'] and not user.get('admin_scope'):raise HTTPException(409,'此来源已绑定其他账号，请联系管理员')
+            if not old['deleted']:raise HTTPException(409,'此来源已经添加，请直接管理来源')
             db.execute('UPDATE number_owners SET deleted=0 WHERE number_key=?',(old['number_key'],))
             saved=number_profile(old);saved.update(archived=False,label=data.label.strip() or saved.get('label',''))
             db.execute('UPDATE managed_numbers SET encrypted_profile=? WHERE id=?',(cipher().encrypt(json.dumps(saved).encode()),old['id']))
@@ -614,51 +552,12 @@ def number_edit(ident: str, data: NumberEdit, user=Depends(current_user)):
         db.execute('BEGIN IMMEDIATE')
         row = require_number(db,ident,user)
         if not row:
-            raise HTTPException(404, "号码不存在")
+            raise HTTPException(404, "来源不存在")
         profile = number_profile(row)
         profile.update(label=data.label.strip(), archived=data.archived)
         db.execute("UPDATE managed_numbers SET encrypted_profile=? WHERE id=?", (cipher().encrypt(json.dumps(profile).encode()), ident))
         db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,'number_edit',?)", (user["user_id"], int(time.time())))
     return {"ok": True}
-
-
-@app.post("/api/numbers/{ident}/actions")
-def number_action(ident: str, data: NumberAction, user=Depends(current_user)):
-    if data.action not in ("activate", "status", "enable_hosting", "start", "stop", "restart", "send_code", "login", "save_device_id"):
-        raise HTTPException(400, "不支持的号码操作")
-    if data.action == "activate" and not data.token:
-        raise HTTPException(400, "需要本号码的有效登录 token")
-    if data.action == 'save_device_id':
-        if not data.device_id.strip() or any(ord(c)<32 or 127<=ord(c)<=159 for c in data.device_id):
-            raise HTTPException(400,'设备标识不能为空或包含控制字符')
-    if data.action == "send_code" and not data.captcha_token:
-        raise HTTPException(400, "请先完成官方人机验证")
-    if data.action == "login" and not re.fullmatch(r"\d{4,8}", data.code):
-        raise HTTPException(400, "请输入本次登录验证码")
-    with database() as db:
-        db.execute('BEGIN IMMEDIATE')
-        require_number(db,ident,user)
-        now = int(time.time())
-        if db.execute("SELECT 1 FROM control_jobs WHERE number_id=? AND state IN ('queued','running')", (ident,)).fetchone():
-            raise HTTPException(409, "此号码还有操作正在执行")
-        if data.action in ("send_code", "login") and db.execute("SELECT 1 FROM control_jobs WHERE number_id=? AND action=? AND created_at>?", (ident, data.action, now-60)).fetchone():
-            raise HTTPException(429, "请至少间隔 60 秒再操作")
-        jid = secrets.token_hex(16)
-        payload = cipher().encrypt(data.model_dump_json().encode())
-        db.execute("INSERT INTO control_jobs VALUES(?,?,?,?,?,?,?,?)", (jid, ident, data.action, payload, "queued", None, now, now))
-        db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,?,?)", (user["user_id"], "number_" + data.action, now))
-    return {"job_id": jid}
-
-
-@app.get("/api/jobs/{ident}")
-def number_job(ident: str, user=Depends(current_user)):
-    with database() as db:
-        job=db.execute("SELECT number_id FROM control_jobs WHERE id=?",(ident,)).fetchone()
-        if job: require_number(db,job[0],user,deleted=True)
-        row = db.execute("SELECT state,result,created_at,updated_at FROM control_jobs WHERE id=?", (ident,)).fetchone()
-    if not row:
-        raise HTTPException(404, "操作不存在")
-    return {**dict(row), "result": json.loads(row["result"]) if row["result"] else None}
 
 
 @app.get("/api/calls")
@@ -688,14 +587,11 @@ def calls_list(account: str = "", page: int = 1, user=Depends(current_user)):
 @app.delete('/api/numbers/{ident}')
 def delete_number(ident:str,user=Depends(current_user)):
     with database() as db:
-        db.execute('BEGIN IMMEDIATE')
-        row=require_number(db,ident,user,deleted=True)
-        if db.execute("SELECT 1 FROM control_jobs WHERE number_id=? AND state IN ('queued','running')",(ident,)).fetchone():raise HTTPException(409,'号码仍有操作执行中，请稍后删除')
-        now=int(time.time());jid=secrets.token_hex(16)
+        db.execute('BEGIN IMMEDIATE');row=require_number(db,ident,user,deleted=True)
         db.execute('UPDATE number_owners SET deleted=1 WHERE number_key=?',(row['number_key'],))
-        db.execute("INSERT INTO control_jobs VALUES(?,?,?,?,'queued',NULL,?,?)",(jid,ident,'delete',cipher().encrypt(b'{}'),now,now))
-        db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,'number_delete',?)",(user['user_id'],now))
-    return {'job_id':jid,'message':'号码已移入回收站，停止接收任务已提交；历史记录保留，不修改无忧行托管开关'}
+        db.execute('UPDATE ingress_tokens SET enabled=0 WHERE number_id=?',(ident,))
+        db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,'number_delete',?)",(user['user_id'],int(time.time())))
+    return {'message':'来源已移入回收站，接入密钥已撤销；历史记录保留。恢复后需创建新密钥。'}
 
 
 class UserCreate(BaseModel):
@@ -717,8 +613,7 @@ def admin_overview(user=Depends(admin_user)):
         users=[dict(r) for r in db.execute('SELECT u.id,u.username,u.role,u.disabled,u.created_at,(SELECT COUNT(*) FROM number_owners o WHERE o.user_id=u.id AND deleted=0) AS numbers FROM users u ORDER BY u.id')]
         numbers=[]
         for r in db.execute('SELECT n.*,o.user_id AS owner_id,o.deleted,u.username FROM managed_numbers n LEFT JOIN number_owners o ON o.number_key=n.number_key LEFT JOIN users u ON u.id=o.user_id ORDER BY n.created_at DESC'):
-            job=db.execute("SELECT state,result FROM control_jobs WHERE number_id=? AND action='delete' ORDER BY created_at DESC LIMIT 1",(r['id'],)).fetchone()
-            numbers.append({'id':r['id'],'owner_id':r['owner_id'],'username':r['username'],'deleted':bool(r['deleted']),**number_profile(r),'delete_state':job['state'] if job else None})
+            numbers.append({'id':r['id'],'owner_id':r['owner_id'],'username':r['username'],'deleted':bool(r['deleted']),**number_profile(r),'delete_state':'done'})
     return {'users':users,'numbers':numbers,'collector':collector_status()}
 
 
@@ -751,7 +646,7 @@ def assign_owner(ident:str,data:OwnerChange,user=Depends(admin_user)):
         db.execute('BEGIN IMMEDIATE')
         row=require_number(db,ident,user)
         if not db.execute('SELECT 1 FROM users WHERE id=? AND disabled=0',(data.user_id,)).fetchone():raise HTTPException(400,'请选择有效用户')
-        if db.execute("SELECT 1 FROM control_jobs WHERE number_id=? AND state IN ('queued','running')",(ident,)).fetchone():raise HTTPException(409,'号码还有操作正在执行')
+        db.execute('UPDATE ingress_tokens SET enabled=0 WHERE number_id=?',(ident,))
         db.execute('UPDATE number_owners SET user_id=? WHERE number_key=?',(data.user_id,row['number_key']))
         db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,'number_assign',?)",(user['user_id'],int(time.time())))
     return {'ok':True}
@@ -761,7 +656,6 @@ def assign_owner(ident:str,data:OwnerChange,user=Depends(admin_user)):
 def restore_number(ident:str,user=Depends(admin_user)):
     with database() as db:
         row=require_number(db,ident,user,deleted=True)
-        if db.execute("SELECT 1 FROM control_jobs WHERE number_id=? AND state IN ('queued','running')",(ident,)).fetchone():raise HTTPException(409,'请等待删除任务结束')
         db.execute('UPDATE number_owners SET deleted=0 WHERE number_key=?',(row['number_key'],))
         db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,'number_restore',?)",(user['user_id'],int(time.time())))
     return {'ok':True}
@@ -836,22 +730,6 @@ def announcement_read(ident:str,user=Depends(current_user)):
     return {'ok':True}
 
 
-@app.post('/api/numbers/{ident}/credentials')
-def number_credentials(ident:str,user=Depends(current_user)):
-    with database() as db:
-        require_number(db,ident,user)
-        r=db.execute('SELECT encrypted_record,updated_at FROM number_credentials WHERE number_id=?',(ident,)).fetchone()
-        db.execute("INSERT INTO audit(user_id,action,created_at) VALUES(?,'credentials_view',?)",(user['user_id'],int(time.time())))
-    return {'values':json.loads(cipher().decrypt(r[0])) if r else {},'updated_at':r[1] if r else None}
-
-
-@app.get('/login-captcha', response_class=HTMLResponse)
-def login_captcha(nonce: str, user=Depends(current_user)):
-    if not re.fullmatch(r'[a-f0-9]{32}',nonce):
-        raise HTTPException(400,'验证窗口参数无效')
-    return HTMLResponse((STATIC/'login-captcha.html').read_text().replace('__WINDOW_NONCE__',nonce))
-
-
 forwarding.register(app,database,cipher,serialize_message,current_user)
-
 wecom_commands.register(app,database,cipher,current_user)
+ingress.register(app,database,cipher,key_hash,current_user,require_number,utc_text)

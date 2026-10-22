@@ -173,7 +173,7 @@ def initialize():
 def enqueue(db, message_id):
  # Same transaction as message insert: a crash cannot lose the outbox entry.
  now=int(time.time())
- for c in db.execute('SELECT id,rules FROM forward_channels WHERE enabled=1 AND created_after_id<?',(message_id,)).fetchall():
+ for c in db.execute('SELECT c.id,c.rules FROM forward_channels c JOIN channel_owners o ON o.channel_id=c.id JOIN number_owners n ON n.user_id=o.user_id JOIN messages m ON m.account_key=n.number_key JOIN users u ON u.id=o.user_id WHERE c.enabled=1 AND c.created_after_id<? AND m.id=? AND n.deleted=0 AND u.disabled=0',(message_id,message_id)).fetchall():
   if 'sms' not in json.loads(c['rules']).get('events',['sms']):continue
   db.execute("INSERT OR IGNORE INTO forward_jobs(id,channel_id,message_id,state,next_at,created_at,updated_at) VALUES(?,?,?,'pending',?,?,?)",(uuid.uuid4().hex,c['id'],message_id,now,now,now))
 
@@ -194,7 +194,7 @@ def process_one():
    record=json.loads(crypto().decrypt(msg['encrypted_record']))
    label={'incoming':'收到来电','missed':'未接来电','ended':'收到来电结束记录'}.get(record.get('event'),'来电状态通知')
    item={'id':msg['id'],'recipient':record['account'],'sender':record.get('sender',''),
-     'received_at':msg['received_at'],'source':'无忧行','event_label':label,'kind':'call','body':label}
+     'received_at':msg['received_at'],'source':record.get('source_name','HTTP 接入'),'event_label':label,'kind':'call','body':label}
    clear=label+' '+item['sender']+' '+item['recipient']
   else:
    item=serialize(msg,reveal=rules.get('allow_sensitive',False));item.update(kind='sms',event_label='收到短信')

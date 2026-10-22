@@ -1,49 +1,33 @@
-name: jego-sms-console
+name: xinbox
 services:
   web:
-    build:
-      context: .
-      dockerfile: ${SMS_DOCKERFILE:-Dockerfile}
-      args:
-        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+    build: .
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8787:8787"
+      - "${XINBOX_BIND:-127.0.0.1}:${XINBOX_PORT:-8787}:8787"
     environment:
       SMS_DATA_DIR: /data
-      SMS_SOURCE_DB: /source/research-sms.sqlite3
-      SMS_SOURCE_KEY: /source/sms-storage.key
-      SMS_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
-      SMS_SECURE_COOKIE: "true"
-      TZ: Asia/Shanghai
+      SMS_STATIC_DIR: /app/static
+      SMS_SECURE_COOKIE: "${XINBOX_SECURE_COOKIE:-false}"
     volumes:
-      - ./backend/wecom_commands.py:/app/wecom_commands.py:ro
-      - /etc/wecom-sms-command-bridge.json:/run/secrets/wecom-command-bridge.json:ro
-      - ./frontend/dist:/app/static:ro
-      - ./backend/forwarding.py:/app/forwarding.py:ro
-      - ./backend/app.py:/app/app.py:ro
-      - ./data:/data
-      - ${SMS_SOURCE_DIR:-/opt/jego-sms-source}:/source:ro
-      - ./admin-initial-password.txt:/run/secrets/admin_password:ro
+      - xinbox_data:/data
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    mem_limit: 192m
-    pids_limit: 64
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "3"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 100
+    mem_limit: 384m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=3)"]
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
-
-
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  xinbox_data:
