@@ -1,0 +1,15 @@
+[Unit]
+Description=Authorized number control worker
+After=network-online.target docker.service
+[Service]
+Type=simple
+WorkingDirectory=/opt/jego-sms-web
+ExecStart=/usr/bin/python3 /opt/jego-sms-web/tools/control_worker.py
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+LimitCORE=0
+[Install]
+WantedBy=multi-user.target

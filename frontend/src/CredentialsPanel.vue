@@ -1,0 +1,10 @@
+<script setup>
+import {ref} from 'vue'
+const props=defineProps({api:Function,id:String})
+const dialog=ref(null),values=ref({}),busy=ref(false),error=ref(''),visible=ref(false)
+const labels={token:'登录 Token',phone_token:'电话 Token',device_id:'登录 deviceId',hosting_device_id:'托管 deviceId',enrollId:'enrollId',protocol_profile:'协议版本'}
+async function open(){values.value={};visible.value=false;error.value='';dialog.value.showModal();busy.value=true;try{values.value=(await props.api('/numbers/'+props.id+'/credentials',{method:'POST'})).values}catch(e){error.value=e.message}finally{busy.value=false}}
+async function copy(v){try{await navigator.clipboard.writeText(v);error.value='已复制'}catch{error.value='复制失败，请显示后手动复制'}}
+</script>
+<template><button class="text-button" @click="open">登录参数</button><dialog ref="dialog" class="credentials-dialog" @close="values={};visible=false"><header><h3>登录参数</h3><button class="button" @click="dialog.close()">关闭</button></header><p v-if="busy">正在读取…</p><p v-if="error" role="status">{{error}}</p><p v-if="!busy&&!Object.keys(values).length">尚未保存登录参数，请完成验证码登录。</p><label v-for="(v,k) in values" :key="k">{{labels[k]||k}}<div><input readonly :value="v" :type="visible?'text':'password'"><button class="button" @click="copy(v)">复制</button></div></label><button v-if="Object.keys(values).length" class="button" @click="visible=!visible">{{visible?'隐藏参数':'显示参数'}}</button></dialog></template>
+<style scoped>.credentials-dialog{position:fixed;inset:0;margin:auto;width:min(620px,calc(100vw - 28px));max-height:85dvh;overflow:auto;padding:24px;border:1px solid #e2e8f5;border-radius:16px;background:white;color:#526787;box-shadow:0 20px 70px #6b7fa32b}.credentials-dialog::backdrop{background:#627a9d66;backdrop-filter:blur(3px)}header{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:20px}h3{font-size:17px}label{display:grid;gap:8px;margin:16px 0;font-size:13px}label>div{display:flex;gap:8px}input{min-width:0;flex:1;padding:10px;border:1px solid #e1e7f3;border-radius:8px;background:#f8faff;color:#607492;font:inherit}p{font-size:13px;line-height:1.8}</style>

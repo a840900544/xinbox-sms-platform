@@ -1,0 +1,22 @@
+[Unit]
+Description=Encrypted SMS source bridge for the private SMS console
+After=local-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/jego-sms-web
+ExecStart=/usr/bin/python3 /opt/jego-sms-web/tools/source_bridge.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/jego-research
+ReadWritePaths=/opt/jego-sms-source
+MemoryMax=64M
+TasksMax=8
+
+[Install]
+WantedBy=multi-user.target
